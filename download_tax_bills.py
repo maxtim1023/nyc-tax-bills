@@ -26,9 +26,6 @@ TARGET_BILLS = [
     ("November 2025", re.compile(r"nov\w*[\s/\-]*2025", re.IGNORECASE), "tax_bill_november_2025.pdf"),
 ]
 
-# Fallback: navigate here directly when the nyc.gov nav can't reach the form
-DIRECT_SEARCH_URL = "https://webapps.nyc.gov/NYCPROP/findmyland.html"
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -101,45 +98,6 @@ def _first_visible(page: Page, text: str, timeout_ms: int = 3_000):
     return None
 
 
-def _address_form_visible(page: Page) -> bool:
-    """Return True when a house-number input is visible anywhere on the page."""
-    selectors = [
-        "input[name*='housenum' i]",
-        "input[id*='housenum' i]",
-        "input[name*='house' i]",
-        "input[id*='house' i]",
-        "input[placeholder*='house' i]",
-        "input[placeholder*='number' i]",
-        # more generic: any labelled text input near 'house' text
-    ]
-    for frame in [page.main_frame, *page.frames]:
-        for sel in selectors:
-            try:
-                if frame.locator(sel).first.is_visible(timeout=500):
-                    return True
-            except Exception:
-                pass
-    return False
-
-
-def _dump_links(page: Page) -> list[str]:
-    """Return text of every visible link/tab/button on the page (for debugging)."""
-    found = []
-    for frame in [page.main_frame, *page.frames]:
-        for sel in ["a", "button", "[role='tab']", "[role='link']"]:
-            try:
-                for loc in frame.locator(sel).all():
-                    try:
-                        if loc.is_visible(timeout=200):
-                            txt = loc.inner_text(timeout=200).strip()
-                            if txt:
-                                found.append(txt)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    return found
-
 
 # ── Navigation steps ───────────────────────────────────────────────────────────
 
@@ -154,93 +112,6 @@ def click_text_robust(page: Page, context: BrowserContext, text: str) -> Page:
         )
     return _click_and_follow(loc, page, context)
 
-
-def navigate_to_address_search(page: Page, context: BrowserContext) -> Page:
-    """
-    Reach the property address-search form.  Strategy (in order):
-      1. Form already visible — done.
-      2. Click a tab/link whose text suggests address search.
-      3. Navigate directly to the search URL as a last resort.
-    Saves a screenshot + link list before attempting anything so the caller
-    can inspect the page state regardless of outcome.
-    """
-    # Give any JS a moment to finish rendering after the previous navigation
-    try:
-        page.wait_for_timeout(1_500)
-    except Exception:
-        pass
-
-    # ── Diagnose: always print visible links at this point ──────────────────
-    links = _dump_links(page)
-    print("   Visible links/tabs on page:")
-    if links:
-        for t in links:
-            print(f"     · {t!r}")
-    else:
-        print("     (none found)")
-
-    # Save a screenshot so the user can see the page visually
-    try:
-        shot = Path("step4_page.png")
-        page.screenshot(path=str(shot), full_page=True)
-        print(f"   Screenshot saved → {shot.resolve()}")
-    except Exception as e:
-        print(f"   (screenshot failed: {e})")
-
-    # 1 — form already on screen
-    if _address_form_visible(page):
-        print("   Address form is already visible — no tab click needed.")
-        return page
-
-    # 2 — click a matching tab/link
-    candidates = [
-        "Property Address Search",
-        "Address Search",
-        "Search by Address",
-        "By Address",
-        "Address",
-    ]
-    # Also try any visible link whose text contains "address" or "propert"
-    broad_pattern = re.compile(r"address|propert", re.IGNORECASE)
-    for lnk_text in links:
-        if broad_pattern.search(lnk_text) and lnk_text not in candidates:
-            candidates.append(lnk_text)
-
-    for text in candidates:
-        loc = _first_visible(page, text, timeout_ms=2_000)
-        if loc is None:
-            continue
-        print(f"   Clicking '{text}'…")
-        page = _click_and_follow(loc, page, context)
-        try:
-            page.wait_for_timeout(1_000)
-        except Exception:
-            pass
-        if _address_form_visible(page):
-            return page
-
-    # 3 — direct URL fallback
-    print(f"   Tab search unsuccessful; navigating directly to {DIRECT_SEARCH_URL}")
-    page.goto(DIRECT_SEARCH_URL, timeout=30_000)
-    wait_stable(page)
-    try:
-        page.wait_for_timeout(1_500)
-    except Exception:
-        pass
-
-    if not _address_form_visible(page):
-        try:
-            page.screenshot(path="step4_direct_debug.png", full_page=True)
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Could not reach the address-search form even after direct navigation.\n"
-            f"  URL  : {page.url}\n"
-            f"  Title: {page.title()!r}\n"
-            f"  Hint : open step4_direct_debug.png to see what the browser shows."
-        )
-
-    return page
 
 
 def click_agree_if_present(page: Page, context: BrowserContext) -> Page:
@@ -394,8 +265,8 @@ def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
         page = click_text_robust(page, context, "View Property Tax Bills and Notices")
         log_state(page, "3")
 
-        print("4. Navigating to address-search form…")
-        page = navigate_to_address_search(page, context)
+        print("4. Clicking 'Property Address Search'…")
+        page = click_text_robust(page, context, "Property Address Search")
         log_state(page, "4")
 
         print("4b. Clicking 'Agree' (disclaimer)…")
