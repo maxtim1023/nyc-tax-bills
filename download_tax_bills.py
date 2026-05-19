@@ -135,95 +135,123 @@ def click_agree_if_present(page: Page, context: BrowserContext) -> Page:
 
 
 def fill_address_form(page: Page, house_number: str, street_name: str, borough_code: str) -> None:
-    """Fill borough, house number, and street name. Raises if fields cannot be found."""
-    # Wait up to 10 s for the form to appear after the Agree click
-    house_selectors = [
-        "input[name*='housenum' i]",
-        "input[id*='housenum' i]",
-        "input[name*='house' i]",
-        "input[id*='house' i]",
-        "input[placeholder*='house' i]",
-        "input[placeholder*='number' i]",
-    ]
-    street_selectors = [
-        "input[name*='street' i]",
-        "input[id*='street' i]",
-        "input[placeholder*='street' i]",
-    ]
-    borough_selectors = [
-        "select[name*='boro' i]",
-        "select[id*='boro' i]",
-        "select[name*='borough' i]",
-        "select[id*='borough' i]",
-        "select",
-    ]
-
-    combined_sel = ", ".join(house_selectors)
+    """Fill the address search form. Raises if required fields are not found."""
+    # Save screenshot so we can see the page state
     try:
-        page.wait_for_selector(combined_sel, timeout=10_000)
+        page.screenshot(path="debug_pts_home.png", full_page=True)
+        print("   Screenshot saved → debug_pts_home.png")
+    except Exception:
+        pass
+
+    # Wait for ANY text input to appear (ASP.NET IDs won't contain 'house'/'street')
+    try:
+        page.wait_for_selector("input[type='text'], input:not([type])", timeout=10_000)
     except PlaywrightTimeoutError:
         raise RuntimeError(
-            "Address form did not appear after clicking Agree.\n"
+            f"No form inputs appeared after Agree.\n"
             f"  URL  : {page.url}\n"
-            f"  Title: {page.title()!r}\n"
-            "  Hint : re-run with --visible to watch the browser."
+            f"  Title: {page.title()!r}"
         )
+
+    # Dump every visible input/select so we know exact names and IDs
+    print("   Visible form fields:")
+    all_text_inputs = []
+    for frame in [page.main_frame, *page.frames]:
+        for loc in frame.locator("input, select").all():
+            try:
+                if not loc.is_visible(timeout=200):
+                    continue
+                t    = loc.get_attribute("type") or "text"
+                name = loc.get_attribute("name") or ""
+                id_  = loc.get_attribute("id") or ""
+                ph   = loc.get_attribute("placeholder") or ""
+                print(f"     · type={t!r}  name={name!r}  id={id_!r}  placeholder={ph!r}")
+                if t in ("text", ""):
+                    all_text_inputs.append(loc)
+            except Exception:
+                pass
 
     filled_house = False
     filled_street = False
-    filled_borough = False
 
-    for frame in [page.main_frame, *page.frames]:
-        # Borough dropdown
-        if not filled_borough:
-            for sel in borough_selectors:
-                try:
-                    loc = frame.locator(sel).first
-                    if loc.is_visible(timeout=500):
-                        loc.select_option(value=borough_code)
-                        print(f"   Borough dropdown set to code {borough_code}")
-                        filled_borough = True
-                        break
-                except Exception:
-                    pass
+    # ── Try by visible label (most reliable for ASP.NET forms) ────────────
+    for label_text in ["House Number", "House No", "Bldg No", "Building Number", "Low"]:
+        try:
+            loc = page.get_by_label(label_text, exact=False).first
+            if loc.is_visible(timeout=1_000):
+                loc.fill(house_number)
+                print(f"   House number filled via label {label_text!r}")
+                filled_house = True
+                break
+        except Exception:
+            pass
 
-        # House number
-        if not filled_house:
-            for sel in house_selectors:
-                try:
-                    loc = frame.locator(sel).first
-                    if loc.is_visible(timeout=500):
-                        loc.fill(house_number)
-                        print(f"   House number filled: {house_number!r}")
-                        filled_house = True
-                        break
-                except Exception:
-                    pass
+    for label_text in ["Street Name", "Street", "Address"]:
+        try:
+            loc = page.get_by_label(label_text, exact=False).first
+            if loc.is_visible(timeout=1_000):
+                loc.fill(street_name)
+                print(f"   Street name filled via label {label_text!r}")
+                filled_street = True
+                break
+        except Exception:
+            pass
 
-        # Street name
-        if not filled_street:
-            for sel in street_selectors:
-                try:
-                    loc = frame.locator(sel).first
-                    if loc.is_visible(timeout=500):
-                        loc.fill(street_name)
-                        print(f"   Street name filled: {street_name!r}")
-                        filled_street = True
-                        break
-                except Exception:
-                    pass
+    for label_text in ["Borough", "Boro"]:
+        try:
+            loc = page.get_by_label(label_text, exact=False).first
+            if loc.is_visible(timeout=1_000):
+                loc.select_option(value=borough_code)
+                print(f"   Borough set via label {label_text!r}")
+                break
+        except Exception:
+            pass
+
+    # ── Fall back to name/id attribute selectors ───────────────────────────
+    if not filled_house:
+        for sel in ["input[name*='housenum' i]", "input[id*='housenum' i]",
+                    "input[name*='house' i]",    "input[id*='house' i]",
+                    "input[name*='low' i]",       "input[id*='low' i]"]:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=500):
+                    loc.fill(house_number)
+                    print(f"   House number filled via {sel!r}")
+                    filled_house = True
+                    break
+            except Exception:
+                pass
+
+    if not filled_street:
+        for sel in ["input[name*='street' i]", "input[id*='street' i]",
+                    "input[name*='addr' i]",    "input[id*='addr' i]"]:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=500):
+                    loc.fill(street_name)
+                    print(f"   Street name filled via {sel!r}")
+                    filled_street = True
+                    break
+            except Exception:
+                pass
+
+    # ── Last resort: fill first two visible text inputs positionally ───────
+    if not filled_house and len(all_text_inputs) >= 1:
+        all_text_inputs[0].fill(house_number)
+        print("   House number filled positionally (1st text input)")
+        filled_house = True
+    if not filled_street and len(all_text_inputs) >= 2:
+        all_text_inputs[1].fill(street_name)
+        print("   Street name filled positionally (2nd text input)")
+        filled_street = True
 
     if not filled_house:
         raise RuntimeError(
-            "Could not find the house-number input field.\n"
-            f"  URL  : {page.url}\n"
-            "  Hint : re-run with --visible and check the form field names."
+            "Could not find house-number input. Check debug_pts_home.png and the field list above."
         )
     if not filled_street:
         raise RuntimeError(
-            "Could not find the street-name input field.\n"
-            f"  URL  : {page.url}\n"
-            "  Hint : re-run with --visible and check the form field names."
+            "Could not find street-name input. Check debug_pts_home.png and the field list above."
         )
 
 
