@@ -4,11 +4,11 @@
 import argparse
 import re
 import sys
-import time
 from pathlib import Path
 
 from playwright.sync_api import (
     BrowserContext,
+    Frame,
     Page,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
@@ -30,8 +30,9 @@ TARGET_BILLS = [
 ]
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
 def parse_address(raw: str) -> tuple[str, str]:
-    """Split '123 Main Street' → ('123', 'Main Street')."""
     parts = raw.strip().split(None, 1)
     if len(parts) < 2:
         raise ValueError(
@@ -41,49 +42,42 @@ def parse_address(raw: str) -> tuple[str, str]:
 
 
 def resolve_borough(value: str) -> str:
-    key = value.strip().lower()
-    code = BOROUGH_MAP.get(key)
+    code = BOROUGH_MAP.get(value.strip().lower())
     if not code:
         raise ValueError(
             f"Unrecognised borough {value!r}. "
-            f"Use one of: Manhattan, Bronx, Brooklyn, Queens, 'Staten Island', or 1-5."
+            "Use one of: Manhattan, Bronx, Brooklyn, Queens, 'Staten Island', or 1-5."
         )
     return code
 
 
-def click_text(page: Page, text: str, timeout: int = 30_000) -> None:
-    """Click the first visible element whose text matches exactly or contains the given string."""
-    locator = page.get_by_text(text, exact=False).first
-    locator.wait_for(state="visible", timeout=timeout)
-    locator.click()
+def log_state(page: Page, step: str) -> None:
+    print(f"   URL   : {page.url}")
+    print(f"   Title : {page.title()!r}")
+    _ = step  # kept for call-site clarity
 
 
 def wait_stable(page: Page, timeout: int = 30_000) -> None:
     page.wait_for_load_state("domcontentloaded", timeout=timeout)
-    page.wait_for_load_state("networkidle", timeout=timeout)
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PlaywrightTimeoutError:
+        pass  # networkidle is best-effort; domcontentloaded is the gate
 
 
-def fill_address_form(page: Page, house_number: str, street_name: str, borough_code: str) -> None:
-    """
-    Fill the DOF property address search form.
-    The form has three fields: borough (select), house number, street name.
-    We probe for them by name/id/label because the selectors can vary.
-    """
-    # Borough dropdown — try by label text first, then common names/ids
-    borough_selectors = [
-        "select[name*='boro' i]",
-        "select[id*='boro' i]",
-        "select[name*='borough' i]",
-        "select[id*='borough' i]",
-        "select",  # last resort: first select on the page
-    ]
-    for sel in borough_selectors:
-        loc = page.locator(sel).first
-        if loc.is_visible():
-            loc.select_option(value=borough_code)
-            break
+def follow_new_tab(context: BrowserContext, page: Page, pages_before: list[Page]) -> Page:
+    """If a new tab was opened, return it (and wait for it to load); else return page."""
+    new_pages = [p for p in context.pages if p not in pages_before]
+    if new_pages:
+        new_page = new_pages[-1]
+        wait_stable(new_page)
+        print(f"   (new tab opened → switching)")
+        return new_page
+    return page
 
-    # House-number input
+
+def _address_form_visible(page: Page) -> bool:
+    """Return True when a house-number input is visible anywhere on the page/frames."""
     house_selectors = [
         "input[name*='housenum' i]",
         "input[id*='housenum' i]",
@@ -92,67 +86,232 @@ def fill_address_form(page: Page, house_number: str, street_name: str, borough_c
         "input[placeholder*='house' i]",
         "input[placeholder*='number' i]",
     ]
-    for sel in house_selectors:
-        loc = page.locator(sel).first
-        if loc.is_visible():
-            loc.fill(house_number)
-            break
+    for frame in [page.main_frame, *page.frames]:
+        for sel in house_selectors:
+            try:
+                if frame.locator(sel).first.is_visible(timeout=500):
+                    return True
+            except Exception:
+                pass
+    return False
 
-    # Street-name input
-    street_selectors = [
-        "input[name*='street' i]",
-        "input[id*='street' i]",
-        "input[placeholder*='street' i]",
+
+def _first_visible_frame_locator(page: Page, text: str):
+    """
+    Search the main frame and all child frames for a visible element
+    containing *text*.  Returns (frame, locator) or (None, None).
+    """
+    for frame in [page.main_frame, *page.frames]:
+        try:
+            loc = frame.get_by_text(text, exact=False).first
+            if loc.is_visible(timeout=2_000):
+                return frame, loc
+        except Exception:
+            pass
+    return None, None
+
+
+# ── Navigation steps ───────────────────────────────────────────────────────────
+
+def click_text_robust(
+    page: Page,
+    context: BrowserContext,
+    text: str,
+    timeout: int = 30_000,
+) -> Page:
+    """
+    Click the first visible element containing *text* (across main frame +
+    iframes).  Returns the active page afterwards — may be a new tab.
+    """
+    pages_before = list(context.pages)
+
+    frame, loc = _first_visible_frame_locator(page, text)
+    if loc is None:
+        raise RuntimeError(
+            f"Cannot find element with text {text!r}.\n"
+            f"  URL  : {page.url}\n"
+            f"  Title: {page.title()!r}\n"
+            f"  Hint : re-run with --visible to watch the browser."
+        )
+    loc.click(timeout=timeout)
+    wait_stable(page)
+
+    return follow_new_tab(context, page, pages_before)
+
+
+def navigate_to_address_search(page: Page, context: BrowserContext) -> Page:
+    """
+    Reach the address-search form.  Handles three layouts:
+      A) Form already visible after step 3 (no click needed).
+      B) A tab/link labelled "Property Address Search" or similar must be clicked.
+      C) The form lives inside an iframe.
+    Returns the active page (may be a new tab).
+    """
+    if _address_form_visible(page):
+        print("   (address form already visible — skipping tab click)")
+        return page
+
+    candidates = [
+        "Property Address Search",
+        "Address Search",
+        "Search by Address",
+        "By Address",
+        "Address",
     ]
-    for sel in street_selectors:
-        loc = page.locator(sel).first
-        if loc.is_visible():
-            loc.fill(street_name)
-            break
+
+    for text in candidates:
+        pages_before = list(context.pages)
+        frame, loc = _first_visible_frame_locator(page, text)
+        if loc is None:
+            continue
+        print(f"   Found tab/link: {text!r} — clicking…")
+        try:
+            loc.click()
+            wait_stable(page)
+            page = follow_new_tab(context, page, pages_before)
+            if _address_form_visible(page):
+                return page
+        except Exception:
+            pass
+
+    if not _address_form_visible(page):
+        # Dump a sample of visible page text to help diagnose
+        try:
+            body_text = page.inner_text("body", timeout=5_000)[:800]
+        except Exception:
+            body_text = "(could not read body)"
+        raise RuntimeError(
+            f"Could not reach the address-search form.\n"
+            f"  URL  : {page.url}\n"
+            f"  Title: {page.title()!r}\n"
+            f"  Body preview:\n{body_text}\n"
+            f"  Hint : re-run with --visible to watch the browser."
+        )
+    return page
+
+
+def fill_address_form(
+    page: Page,
+    house_number: str,
+    street_name: str,
+    borough_code: str,
+) -> None:
+    """Fill borough, house number, and street name across all frames."""
+    for frame in [page.main_frame, *page.frames]:
+        # Borough dropdown
+        for sel in [
+            "select[name*='boro' i]",
+            "select[id*='boro' i]",
+            "select[name*='borough' i]",
+            "select[id*='borough' i]",
+            "select",
+        ]:
+            loc = frame.locator(sel).first
+            try:
+                if loc.is_visible(timeout=500):
+                    loc.select_option(value=borough_code)
+                    break
+            except Exception:
+                pass
+
+        # House number
+        for sel in [
+            "input[name*='housenum' i]",
+            "input[id*='housenum' i]",
+            "input[name*='house' i]",
+            "input[id*='house' i]",
+            "input[placeholder*='house' i]",
+            "input[placeholder*='number' i]",
+        ]:
+            loc = frame.locator(sel).first
+            try:
+                if loc.is_visible(timeout=500):
+                    loc.fill(house_number)
+                    break
+            except Exception:
+                pass
+
+        # Street name
+        for sel in [
+            "input[name*='street' i]",
+            "input[id*='street' i]",
+            "input[placeholder*='street' i]",
+        ]:
+            loc = frame.locator(sel).first
+            try:
+                if loc.is_visible(timeout=500):
+                    loc.fill(street_name)
+                    break
+            except Exception:
+                pass
+
+
+def click_search_button(page: Page, context: BrowserContext) -> Page:
+    pages_before = list(context.pages)
+
+    # Try role=button with "search" name first, then input[type=submit], then any "Find"
+    for attempt in [
+        lambda: page.get_by_role("button", name=re.compile(r"search|find", re.IGNORECASE)).first,
+        lambda: page.locator("input[type='submit']").first,
+        lambda: page.get_by_text("Find", exact=False).first,
+    ]:
+        loc = attempt()
+        try:
+            if loc.is_visible(timeout=2_000):
+                loc.click()
+                wait_stable(page)
+                return follow_new_tab(context, page, pages_before)
+        except Exception:
+            pass
+
+    # Try frames
+    for frame in page.frames:
+        for sel in ["button", "input[type='submit']"]:
+            for loc in frame.locator(sel).all():
+                try:
+                    txt = loc.inner_text(timeout=300).lower()
+                    if "search" in txt or "find" in txt or loc.get_attribute("value", timeout=300) in ("Search", "Find"):
+                        if loc.is_visible(timeout=300):
+                            loc.click()
+                            wait_stable(page)
+                            return follow_new_tab(context, page, pages_before)
+                except Exception:
+                    pass
+
+    raise RuntimeError(
+        f"Could not find a Search/Find button.\n  URL: {page.url}\n  Title: {page.title()!r}"
+    )
 
 
 def find_bill_link(page: Page, pattern: re.Pattern):
-    """Return a Locator for a link whose text matches *pattern*, or None."""
-    # Collect all <a> tags and check text content
-    anchors = page.locator("a").all()
-    for anchor in anchors:
-        try:
-            text = anchor.inner_text(timeout=500).strip()
-        except Exception:
-            continue
-        if pattern.search(text):
-            return anchor
-
-    # Also check table cells (sometimes the date is plain text that triggers a JS click)
-    cells = page.locator("td, th").all()
-    for cell in cells:
-        try:
-            text = cell.inner_text(timeout=500).strip()
-        except Exception:
-            continue
-        if pattern.search(text):
-            return cell
-
+    """Return a locator for a link/cell whose text matches *pattern* across all frames."""
+    for frame in [page.main_frame, *page.frames]:
+        for sel in ["a", "td", "th", "button"]:
+            try:
+                for loc in frame.locator(sel).all():
+                    try:
+                        text = loc.inner_text(timeout=300).strip()
+                    except Exception:
+                        continue
+                    if pattern.search(text):
+                        return loc
+            except Exception:
+                pass
     return None
 
 
 def download_pdf(context: BrowserContext, page: Page, element, output_path: Path) -> None:
     """
     Click *element* and save the resulting PDF.
-    Handles three cases:
-      1. A new browser tab/popup opens with the PDF URL.
-      2. The browser triggers a file-download event.
-      3. The current page navigates to the PDF.
+    Tries: (1) new tab/popup, (2) download event, (3) same-page navigation.
     """
-    # --- Try popup / new-tab first ---
+    # 1 — popup / new tab
     try:
         with context.expect_page(timeout=8_000) as popup_info:
             element.click()
         popup = popup_info.value
-        popup.wait_for_load_state("domcontentloaded", timeout=30_000)
+        wait_stable(popup)
         pdf_url = popup.url
-
-        # Fetch the PDF bytes using the same session context
         response = context.request.get(pdf_url, timeout=60_000)
         if not response.ok:
             raise RuntimeError(f"HTTP {response.status} fetching {pdf_url}")
@@ -160,9 +319,9 @@ def download_pdf(context: BrowserContext, page: Page, element, output_path: Path
         popup.close()
         return
     except PlaywrightTimeoutError:
-        pass  # No popup opened — fall through
+        pass
 
-    # --- Try download event ---
+    # 2 — download event
     try:
         with page.expect_download(timeout=8_000) as dl_info:
             element.click()
@@ -170,9 +329,9 @@ def download_pdf(context: BrowserContext, page: Page, element, output_path: Path
         download.save_as(output_path)
         return
     except PlaywrightTimeoutError:
-        pass  # No download triggered — fall through
+        pass
 
-    # --- Try same-page navigation ---
+    # 3 — same-page navigation
     element.click()
     page.wait_for_load_state("domcontentloaded", timeout=30_000)
     pdf_url = page.url
@@ -184,6 +343,8 @@ def download_pdf(context: BrowserContext, page: Page, element, output_path: Path
             f"Could not download PDF (HTTP {response.status}) from {pdf_url}"
         )
 
+
+# ── Main flow ──────────────────────────────────────────────────────────────────
 
 def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
     house_number, street_name = parse_address(address)
@@ -200,53 +361,55 @@ def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
-        # ── Step 1: NYC Finance homepage ───────────────────────────────────
+        # 1 ── NYC Finance homepage
         print("1. Opening NYC Finance homepage…")
         page.goto("https://www.nyc.gov/site/finance/index.page", timeout=60_000)
         wait_stable(page)
+        log_state(page, "1")
 
-        # ── Step 2: "Property Tax Bills and Payments" ──────────────────────
+        # 2 ── Property Tax Bills and Payments
         print("2. Clicking 'Property Tax Bills and Payments'…")
-        click_text(page, "Property Tax Bills and Payments")
-        wait_stable(page)
+        page = click_text_robust(page, context, "Property Tax Bills and Payments")
+        log_state(page, "2")
 
-        # ── Step 3: "View Property Tax Bills and Notices" ──────────────────
+        # 3 ── View Property Tax Bills and Notices
         print("3. Clicking 'View Property Tax Bills and Notices'…")
-        click_text(page, "View Property Tax Bills and Notices")
-        wait_stable(page)
+        page = click_text_robust(page, context, "View Property Tax Bills and Notices")
+        log_state(page, "3")
 
-        # ── Step 4: "Property Address Search" ─────────────────────────────
-        print("4. Clicking 'Property Address Search'…")
-        click_text(page, "Property Address Search")
-        wait_stable(page)
+        # 4 ── Property Address Search (tab / direct form)
+        print("4. Navigating to address search form…")
+        page = navigate_to_address_search(page, context)
+        log_state(page, "4")
 
-        # ── Step 5: Fill in address ────────────────────────────────────────
+        # 5 ── Fill address
         print(f"5. Entering address: {house_number} {street_name} (borough {borough_code})…")
         fill_address_form(page, house_number, street_name, borough_code)
 
-        # ── Step 6: Click Search ───────────────────────────────────────────
+        # 6 ── Search
         print("6. Clicking Search…")
-        search_btn = (
-            page.get_by_role("button", name=re.compile(r"search", re.IGNORECASE)).first
-        )
-        search_btn.click()
-        wait_stable(page)
+        page = click_search_button(page, context)
+        log_state(page, "6")
 
-        # ── Step 7: "Property Tax Bills" ──────────────────────────────────
+        # 7 ── Property Tax Bills tab
         print("7. Clicking 'Property Tax Bills'…")
-        click_text(page, "Property Tax Bills")
-        wait_stable(page)
+        page = click_text_robust(page, context, "Property Tax Bills")
+        log_state(page, "7")
 
-        # ── Step 8: Download each bill ────────────────────────────────────
+        # 8 ── Download each bill
         for label, pattern, filename in TARGET_BILLS:
             output_path = output_dir / filename
             print(f"8. Downloading {label} bill → {output_path.name}…")
 
             element = find_bill_link(page, pattern)
             if element is None:
-                print(f"   ✗ Could not find a link matching '{label}' on the page.")
-                print(f"     Page title: {page.title()!r}")
-                print(f"     Page URL:   {page.url}")
+                print(f"   ✗ No link found matching '{label}'.")
+                print(f"     URL  : {page.url}")
+                print(f"     Title: {page.title()!r}")
+                try:
+                    print(f"     Body preview: {page.inner_text('body', timeout=3_000)[:400]!r}")
+                except Exception:
+                    pass
                 continue
 
             try:
@@ -261,6 +424,8 @@ def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
     print()
     print(f"Done. Bills saved to: {output_dir.resolve()}/")
 
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -309,8 +474,8 @@ Examples:
             output_dir=Path(args.output_dir),
             headless=not args.visible,
         )
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    except (ValueError, RuntimeError) as exc:
+        print(f"\nError: {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
