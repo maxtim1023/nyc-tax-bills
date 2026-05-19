@@ -243,6 +243,17 @@ def navigate_to_address_search(page: Page, context: BrowserContext) -> Page:
     return page
 
 
+def click_agree_if_present(page: Page, context: BrowserContext) -> Page:
+    """Click an Agree/Accept/Continue button if a disclaimer page is shown."""
+    for text in ["Agree", "I Agree", "Accept", "Continue", "I Accept"]:
+        loc = _first_visible(page, text, timeout_ms=4_000)
+        if loc is not None:
+            print(f"   Found '{text}' button — clicking…")
+            return _click_and_follow(loc, page, context)
+    print("   (no disclaimer button found — continuing)")
+    return page
+
+
 def fill_address_form(page: Page, house_number: str, street_name: str) -> None:
     """Fill house number and street name across all frames. Borough is left as-is."""
     for frame in [page.main_frame, *page.frames]:
@@ -386,6 +397,9 @@ def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
         print("4. Navigating to address-search form…")
         page = navigate_to_address_search(page, context)
         log_state(page, "4")
+
+        print("4b. Clicking 'Agree' (disclaimer)…")
+        page = click_agree_if_present(page, context)
 
         print(f"5. Entering address: {house_number} {street_name}…")
         fill_address_form(page, house_number, street_name)
