@@ -194,26 +194,10 @@ def fill_address_form(
     page: Page,
     house_number: str,
     street_name: str,
-    borough_code: str,
+    borough_code: str,  # accepted but intentionally not used
 ) -> None:
-    """Fill borough, house number, and street name across all frames."""
+    """Fill house number and street name across all frames. Borough is left as-is."""
     for frame in [page.main_frame, *page.frames]:
-        # Borough dropdown
-        for sel in [
-            "select[name*='boro' i]",
-            "select[id*='boro' i]",
-            "select[name*='borough' i]",
-            "select[id*='borough' i]",
-            "select",
-        ]:
-            loc = frame.locator(sel).first
-            try:
-                if loc.is_visible(timeout=500):
-                    loc.select_option(value=borough_code)
-                    break
-            except Exception:
-                pass
-
         # House number
         for sel in [
             "input[name*='housenum' i]",
