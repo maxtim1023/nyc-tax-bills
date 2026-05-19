@@ -125,37 +125,97 @@ def click_agree_if_present(page: Page, context: BrowserContext) -> Page:
     return page
 
 
-def fill_address_form(page: Page, house_number: str, street_name: str) -> None:
-    """Fill house number and street name across all frames. Borough is left as-is."""
-    for frame in [page.main_frame, *page.frames]:
-        for sel in [
-            "input[name*='housenum' i]",
-            "input[id*='housenum' i]",
-            "input[name*='house' i]",
-            "input[id*='house' i]",
-            "input[placeholder*='house' i]",
-            "input[placeholder*='number' i]",
-        ]:
-            try:
-                loc = frame.locator(sel).first
-                if loc.is_visible(timeout=500):
-                    loc.fill(house_number)
-                    break
-            except Exception:
-                pass
+def fill_address_form(page: Page, house_number: str, street_name: str, borough_code: str) -> None:
+    """Fill borough, house number, and street name. Raises if fields cannot be found."""
+    # Wait up to 10 s for the form to appear after the Agree click
+    house_selectors = [
+        "input[name*='housenum' i]",
+        "input[id*='housenum' i]",
+        "input[name*='house' i]",
+        "input[id*='house' i]",
+        "input[placeholder*='house' i]",
+        "input[placeholder*='number' i]",
+    ]
+    street_selectors = [
+        "input[name*='street' i]",
+        "input[id*='street' i]",
+        "input[placeholder*='street' i]",
+    ]
+    borough_selectors = [
+        "select[name*='boro' i]",
+        "select[id*='boro' i]",
+        "select[name*='borough' i]",
+        "select[id*='borough' i]",
+        "select",
+    ]
 
-        for sel in [
-            "input[name*='street' i]",
-            "input[id*='street' i]",
-            "input[placeholder*='street' i]",
-        ]:
-            try:
-                loc = frame.locator(sel).first
-                if loc.is_visible(timeout=500):
-                    loc.fill(street_name)
-                    break
-            except Exception:
-                pass
+    combined_sel = ", ".join(house_selectors)
+    try:
+        page.wait_for_selector(combined_sel, timeout=10_000)
+    except PlaywrightTimeoutError:
+        raise RuntimeError(
+            "Address form did not appear after clicking Agree.\n"
+            f"  URL  : {page.url}\n"
+            f"  Title: {page.title()!r}\n"
+            "  Hint : re-run with --visible to watch the browser."
+        )
+
+    filled_house = False
+    filled_street = False
+    filled_borough = False
+
+    for frame in [page.main_frame, *page.frames]:
+        # Borough dropdown
+        if not filled_borough:
+            for sel in borough_selectors:
+                try:
+                    loc = frame.locator(sel).first
+                    if loc.is_visible(timeout=500):
+                        loc.select_option(value=borough_code)
+                        print(f"   Borough dropdown set to code {borough_code}")
+                        filled_borough = True
+                        break
+                except Exception:
+                    pass
+
+        # House number
+        if not filled_house:
+            for sel in house_selectors:
+                try:
+                    loc = frame.locator(sel).first
+                    if loc.is_visible(timeout=500):
+                        loc.fill(house_number)
+                        print(f"   House number filled: {house_number!r}")
+                        filled_house = True
+                        break
+                except Exception:
+                    pass
+
+        # Street name
+        if not filled_street:
+            for sel in street_selectors:
+                try:
+                    loc = frame.locator(sel).first
+                    if loc.is_visible(timeout=500):
+                        loc.fill(street_name)
+                        print(f"   Street name filled: {street_name!r}")
+                        filled_street = True
+                        break
+                except Exception:
+                    pass
+
+    if not filled_house:
+        raise RuntimeError(
+            "Could not find the house-number input field.\n"
+            f"  URL  : {page.url}\n"
+            "  Hint : re-run with --visible and check the form field names."
+        )
+    if not filled_street:
+        raise RuntimeError(
+            "Could not find the street-name input field.\n"
+            f"  URL  : {page.url}\n"
+            "  Hint : re-run with --visible and check the form field names."
+        )
 
 
 def click_search_button(page: Page, context: BrowserContext) -> Page:
@@ -243,7 +303,7 @@ def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Address  : {house_number} {street_name}")
-    print(f"Borough  : {borough}")
+    print(f"Borough  : {borough} (code {borough_code})")
     print(f"Output   : {output_dir.resolve()}")
     print()
 
@@ -271,9 +331,10 @@ def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
 
         print("4b. Clicking 'Agree' (disclaimer)…")
         page = click_agree_if_present(page, context)
+        log_state(page, "4b")
 
-        print(f"5. Entering address: {house_number} {street_name}…")
-        fill_address_form(page, house_number, street_name)
+        print(f"5. Entering address: {house_number} {street_name} (borough: {borough})…")
+        fill_address_form(page, house_number, street_name, borough_code)
 
         print("6. Clicking Search…")
         page = click_search_button(page, context)
@@ -325,8 +386,8 @@ Examples:
     )
     parser.add_argument("address", help="Property address, e.g. '123 Main Street'")
     parser.add_argument(
-        "--borough", "-b", default="Manhattan",
-        help="NYC borough name or 1-5 (default: Manhattan)",
+        "--borough", "-b", default="Bronx",
+        help="NYC borough name or 1-5 (default: Bronx)",
     )
     parser.add_argument(
         "--output-dir", "-o", default="bills",
