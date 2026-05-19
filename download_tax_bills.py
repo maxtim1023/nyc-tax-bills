@@ -116,12 +116,36 @@ def click_text_robust(page: Page, context: BrowserContext, text: str) -> Page:
 
 def click_agree_if_present(page: Page, context: BrowserContext) -> Page:
     """Click an Agree/Accept/Continue button if a disclaimer page is shown."""
-    for text in ["Agree", "I Agree", "Accept", "Continue", "I Accept"]:
-        loc = _first_visible(page, text, timeout_ms=4_000)
+    # Save a screenshot so we can see exactly what the page looks like
+    try:
+        page.screenshot(path="debug_after_step4.png", full_page=True)
+        print("   Screenshot saved → debug_after_step4.png")
+    except Exception:
+        pass
+
+    # Dump every visible clickable element so we know what labels are available
+    print("   Clickable elements on page:")
+    for frame in [page.main_frame, *page.frames]:
+        for sel in ["a", "button", "input[type='submit']", "input[type='button']"]:
+            try:
+                for loc in frame.locator(sel).all():
+                    try:
+                        if loc.is_visible(timeout=200):
+                            txt = (loc.inner_text(timeout=200) or loc.get_attribute("value") or "").strip()
+                            if txt:
+                                print(f"     · {sel}: {txt!r}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    for text in ["Agree", "I Agree", "Accept", "Continue", "I Accept", "OK"]:
+        loc = _first_visible(page, text, timeout_ms=5_000)
         if loc is not None:
-            print(f"   Found '{text}' button — clicking…")
+            print(f"   Found '{text}' — clicking…")
             return _click_and_follow(loc, page, context)
-    print("   (no disclaimer button found — continuing)")
+
+    print("   (no agree button found — continuing)")
     return page
 
 
