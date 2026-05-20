@@ -86,15 +86,17 @@ def _first_visible(page: Page, text: str, timeout_ms: int = 3_000):
     """
     Return the first visible locator whose text contains *text*,
     searching the main frame then all child frames.
+    Only matches <a>, <button>, or role=tab/link/menuitem — never inputs.
     Returns None if not found.
     """
     for frame in [page.main_frame, *page.frames]:
-        try:
-            loc = frame.get_by_text(text, exact=False).first
-            if loc.is_visible(timeout=timeout_ms):
-                return loc
-        except Exception:
-            pass
+        for sel in ["a", "button", "[role='tab']", "[role='link']", "[role='menuitem']"]:
+            try:
+                loc = frame.locator(sel).filter(has_text=text).first
+                if loc.is_visible(timeout=timeout_ms):
+                    return loc
+            except Exception:
+                pass
     return None
 
 
@@ -166,7 +168,7 @@ def fill_address_form(page: Page, house_number: str, street_name: str, borough_c
                 id_  = loc.get_attribute("id") or ""
                 ph   = loc.get_attribute("placeholder") or ""
                 print(f"     · type={t!r}  name={name!r}  id={id_!r}  placeholder={ph!r}")
-                if t in ("text", ""):
+                if t in ("text", "") and name != "search-terms":
                     all_text_inputs.append(loc)
             except Exception:
                 pass
@@ -369,6 +371,16 @@ def run(address: str, borough: str, output_dir: Path, headless: bool) -> None:
         print("4b. Clicking 'Agree' (disclaimer)…")
         page = click_agree_if_present(page, context)
         log_state(page, "4b")
+
+        # The agree step sets a session cookie but may land on Home.aspx.
+        # Navigate directly to the address search form URL.
+        print("4c. Navigating to address search form…")
+        page.goto(
+            "https://a836-pts-access.nyc.gov/care/search/commonsearch.aspx?mode=address",
+            timeout=30_000,
+        )
+        wait_stable(page)
+        log_state(page, "4c")
 
         print(f"5. Entering address: {house_number} {street_name} (borough: {borough})…")
         fill_address_form(page, house_number, street_name, borough_code)
